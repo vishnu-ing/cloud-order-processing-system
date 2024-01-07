@@ -1,0 +1,68 @@
+# ---- Java / Maven ----
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+*.log
+dependency-reduced-pom.xml
+
+# ---- IDE ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+nbproject/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Secrets / local config ----
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+aws-credentials
+application-secret.yml
+
+# ---- Terraform ----
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+.terraformrc
+terraform.rc
+*.tfvars
+!example.tfvars
+
+# ---- AWS SAM ----
+.aws-sam/
+samconfig.toml
+packaged.yaml
+
+# ---- LocalStack / Docker volumes ----
+volume/
+.localstack/
+docker/data/
+
+# ---- Native local stack (README: "Run it without Docker") ----
+kafka_2.13-*/
+kafka_2.13-*.tgz
+dynamodb-local/
+dynamodb_local_latest.tar.gz
+
+# ---- Test / coverage output ----
+surefire-reports/
+failsafe-reports/
+jacoco.exec
+*.hprof
