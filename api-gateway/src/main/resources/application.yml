@@ -1,0 +1,139 @@
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: api-gateway
+  main:
+    banner-mode: "off"
+  cloud:
+    gateway:
+      # Only explicitly declared routes are reachable: no discovery-based auto-routing at the edge.
+      discovery:
+        locator:
+          enabled: false
+      default-filters:
+        # The gateway stamps X-Correlation-Id itself and the downstream service echoes it back;
+        # keep the gateway's copy so clients see exactly one.
+        - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials X-Correlation-Id
+      httpclient:
+        connect-timeout: 2000
+        response-timeout: 8s
+        pool:
+          type: elastic
+          max-idle-time: 30s
+      routes:
+        # ---- Order writes: circuit-broken, never retried (POST is not idempotent without a key) ----
+        - id: orders-write
+          uri: ${ORDER_SERVICE_URI:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/orders/**
+            - Method=POST,PUT,PATCH,DELETE
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: ordersWrite
+                fallbackUri: forward:/fallback/orders
+        # ---- Order reads: circuit-broken and safely retried on 5xx ----
+        - id: orders-read
+          uri: ${ORDER_SERVICE_URI:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/orders/**
+            - Method=GET
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: ordersRead
+                fallbackUri: forward:/fallback/orders
+            - name: Retry
+              args:
+                retries: 2
+                statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
+                methods: GET
+                backoff:
+                  firstBackoff: 100ms
+                  maxBackoff: 500ms
+                  factor: 2
+        # ---- Operator surface: downstream health, reachable only from inside the VPC in AWS ----
+        - id: inventory-actuator
+          uri: ${INVENTORY_SERVICE_URI:http://localhost:8082}
+          predicates:
+            - Path=/internal/inventory/**
+          filters:
+            - StripPrefix=2
+        - id: payment-actuator
+          uri: ${PAYMENT_SERVICE_URI:http://localhost:8083}
+          predicates:
+            - Path=/internal/payment/**
+          filters:
+            - StripPrefix=2
+        - id: notification-actuator
+          uri: ${NOTIFICATION_SERVICE_URI:http://localhost:8084}
+          predicates:
+            - Path=/internal/notification/**
+          filters:
+            - StripPrefix=2
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Set ISSUER_URI (e.g. a Cognito user pool) together with APP_SECURITY_JWT_ENABLED=true.
+          issuer-uri: ${JWT_ISSUER_URI:}
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20
+        minimumNumberOfCalls: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 5
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+    instances:
+      ordersWrite:
+        baseConfig: default
+        # Writes trip sooner: a struggling write path should shed load fast.
+        failureRateThreshold: 40
+      ordersRead:
+        baseConfig: default
+  timelimiter:
+    configs:
+      default:
+        timeoutDuration: 8s
+        cancelRunningFuture: true
+
+app:
+  rate-limit:
+    requests-per-minute: ${RATE_LIMIT_RPM:120}
+  security:
+    jwt:
+      enabled: ${APP_SECURITY_JWT_ENABLED:false}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,gateway
+  endpoint:
+    health:
+      probes:
+        enabled: true
+    gateway:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+logging:
+  level:
+    root: INFO
+    org.springframework.cloud.gateway: ${GATEWAY_LOG_LEVEL:INFO}
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${spring.application.name}] [corr=%X{correlationId:-none}] %logger{36} - %msg%n"

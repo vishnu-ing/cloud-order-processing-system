@@ -1,0 +1,15 @@
+# Local profile. Route URIs come from ORDER_SERVICE_URI and friends, which docker-compose.yml points
+# at the container names; the routes themselves are inherited unchanged from application.yml (a
+# list redefined here would replace that list wholesale and drop the /internal/** routes).
+# JWT validation stays off so the README curl examples work without an identity provider.
+app:
+  rate-limit:
+    # Generous locally so a load-test script does not throttle itself.
+    requests-per-minute: 6000
+  security:
+    jwt:
+      enabled: false
+
+logging:
+  level:
+    org.springframework.cloud.gateway: DEBUG
