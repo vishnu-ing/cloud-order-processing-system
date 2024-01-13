@@ -1,0 +1,19 @@
+# Local profile: LocalStack DynamoDB + KRaft Kafka from docker-compose.yml.
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
+aws:
+  region: us-east-1
+  endpoint-url: ${AWS_ENDPOINT_URL:http://localhost:4566}
+
+app:
+  outbox:
+    poll-interval-ms: 250
+  kafka:
+    listener:
+      concurrency: 1
+
+logging:
+  level:
+    io.orderflow: DEBUG
