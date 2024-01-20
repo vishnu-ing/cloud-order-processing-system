@@ -1,0 +1,26 @@
+# Integration-test profile. Container endpoints are injected by @DynamicPropertySource;
+# everything here is about making the test deterministic and fast.
+spring:
+  kafka:
+    consumer:
+      auto-offset-reset: earliest
+      properties:
+        # Do not wait 3 s for a group coordinator rebalance on every fresh container.
+        session.timeout.ms: 10000
+        heartbeat.interval.ms: 3000
+
+app:
+  orders:
+    max-conflict-retries: 8
+  kafka:
+    retry:
+      initial-interval-ms: 100
+      multiplier: 2.0
+      max-interval-ms: 1000
+      max-retries: 2
+
+logging:
+  level:
+    io.orderflow: DEBUG
+    org.apache.kafka: WARN
+    org.testcontainers: INFO
