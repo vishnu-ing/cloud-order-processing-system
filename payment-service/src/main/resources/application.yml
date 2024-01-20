@@ -1,0 +1,94 @@
+server:
+  port: ${SERVER_PORT:8083}
+  shutdown: graceful
+
+spring:
+  application:
+    name: payment-service
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  main:
+    banner-mode: "off"
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        linger.ms: 5
+        compression.type: snappy
+    consumer:
+      group-id: payment-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: "io.orderflow.common.event.EventEnvelopeSerde$EnvelopeDeserializer"
+        # Payment is the expensive step: smaller batches keep rebalances cheap.
+        max.poll.records: 20
+        max.poll.interval.ms: 300000
+    listener:
+      ack-mode: record
+      observation-enabled: true
+
+aws:
+  region: ${AWS_REGION:us-east-1}
+  endpoint-url: ${AWS_ENDPOINT_URL:}
+  dynamodb:
+    max-retries: 5
+    api-call-timeout-ms: 3000
+
+app:
+  dynamodb:
+    tables:
+      payments: ${PAYMENTS_TABLE:payments}
+      outbox: ${OUTBOX_TABLE:outbox}
+      processed-events: ${PROCESSED_EVENTS_TABLE:processed_events}
+  outbox:
+    initial-delay-ms: 2000
+    poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:500}
+    batch-size: 50
+    max-attempts: 10
+    send-timeout-seconds: 5
+  idempotency:
+    retention-days: 7
+  payments:
+    # Deterministic gateway rules; see SimulatedPaymentGateway.
+    decline-above: ${PAYMENT_DECLINE_ABOVE:5000.00}
+    timeout-bucket-percent: ${PAYMENT_TIMEOUT_PERCENT:0}
+    decline-bucket-percent: ${PAYMENT_DECLINE_PERCENT:10}
+  kafka:
+    listener:
+      concurrency: ${KAFKA_CONCURRENCY:3}
+    retry:
+      initial-interval-ms: 500
+      multiplier: 2.0
+      max-interval-ms: 10000
+      max-retries: 4
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+logging:
+  level:
+    root: INFO
+    io.orderflow: ${LOG_LEVEL:INFO}
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${spring.application.name}] [corr=%X{correlationId:-none} order=%X{orderId:-none}] %logger{36} - %msg%n"

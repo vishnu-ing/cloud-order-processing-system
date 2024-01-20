@@ -1,0 +1,345 @@
+{
+  "info": {
+    "name": "Cloud Order Processing System",
+    "_postman_id": "9c1f4b7e-7a12-4d55-9c0a-0f4c8b8d1a21",
+    "description": "Drives the full saga against the local docker compose stack.\n\nRun the folder in order, or use the Collection Runner: **Create order** stores the `orderId` and a fresh `Idempotency-Key`, **Poll timeline** re-runs itself until the order reaches a terminal state, and the remaining requests demonstrate idempotent replay, the out-of-stock rejection and cancellation-driven compensation.\n\nPrerequisites: `docker compose up -d`, then `./scripts/create-tables.sh` if you are not using the LocalStack init hook.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080", "type": "string" },
+    { "key": "customerId", "value": "cust-9f2a", "type": "string" },
+    { "key": "orderId", "value": "", "type": "string" },
+    { "key": "idempotencyKey", "value": "", "type": "string" },
+    { "key": "pollAttempts", "value": "0", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "1. Create order",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// A fresh key per run, kept so request 3 can prove the replay behaviour.",
+              "pm.collectionVariables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+              "pm.collectionVariables.set('pollAttempts', '0');"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "const body = pm.response.json();",
+              "pm.test('order starts in PENDING', () => pm.expect(body.status).to.eql('PENDING'));",
+              "pm.test('correlation id is returned', () => pm.expect(pm.response.headers.get('X-Correlation-Id')).to.be.a('string'));",
+              "pm.collectionVariables.set('orderId', body.orderId);",
+              "console.log('orderId =', body.orderId);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "{{idempotencyKey}}" },
+          { "key": "X-Correlation-Id", "value": "{{$guid}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"customerEmail\": \"dana@example.com\",\n  \"currency\": \"USD\",\n  \"lines\": [\n    { \"sku\": \"SKU-BOOK-1\", \"quantity\": 2, \"unitPrice\": 42.50 },\n    { \"sku\": \"SKU-HEADSET-1\", \"quantity\": 1, \"unitPrice\": 189.00 }\n  ]\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+        "description": "Returns 201 immediately: the order is durably PENDING and OrderCreated is in the outbox. The saga continues over Kafka."
+      }
+    },
+    {
+      "name": "2. Poll timeline until terminal",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "const terminal = ['CONFIRMED', 'REJECTED', 'CANCELLED', 'FAILED'];",
+              "console.log('status =', body.status, '| steps =', body.events.map(e => e.eventType).join(' -> '));",
+              "",
+              "if (terminal.includes(body.status)) {",
+              "  pm.test('saga reached a terminal state', () => pm.expect(terminal).to.include(body.status));",
+              "  pm.test('timeline records every step', () => pm.expect(body.events.length).to.be.at.least(2));",
+              "  return;",
+              "}",
+              "",
+              "// Re-run this request until the saga settles, up to 15 attempts (~15s).",
+              "const attempts = Number(pm.collectionVariables.get('pollAttempts')) + 1;",
+              "pm.collectionVariables.set('pollAttempts', String(attempts));",
+              "if (attempts < 15) {",
+              "  setTimeout(() => {}, 1000);",
+              "  pm.execution.setNextRequest('2. Poll timeline until terminal');",
+              "} else {",
+              "  pm.test('saga settled within 15 polls', () => pm.expect.fail('still ' + body.status));",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}/timeline",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders", "{{orderId}}", "timeline"]
+        },
+        "description": "The saga event history: ORDER_CREATED -> INVENTORY_RESERVED -> PAYMENT_CAPTURED -> ORDER_CONFIRMED, each entry linked to its cause."
+      }
+    },
+    {
+      "name": "3. Replay the same Idempotency-Key",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200, not 201: the request was replayed', () => pm.response.to.have.status(200));",
+              "pm.test('same order is returned', () => pm.expect(pm.response.json().orderId).to.eql(pm.collectionVariables.get('orderId')));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "{{idempotencyKey}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"customerEmail\": \"dana@example.com\",\n  \"currency\": \"USD\",\n  \"lines\": [\n    { \"sku\": \"SKU-BOOK-1\", \"quantity\": 2, \"unitPrice\": 42.50 },\n    { \"sku\": \"SKU-HEADSET-1\", \"quantity\": 1, \"unitPrice\": 189.00 }\n  ]\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+        "description": "Proves the HTTP idempotency contract: a retried create returns the original order with 200 instead of creating a second one."
+      }
+    },
+    {
+      "name": "4. Get order",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('lines are returned', () => pm.expect(body.lines).to.have.lengthOf(2));",
+              "pm.test('total is the sum of the lines', () => pm.expect(Number(body.totalAmount)).to.eql(274.0));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders", "{{orderId}}"]
+        }
+      }
+    },
+    {
+      "name": "5. List customer orders (cursor page 1)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('newest first', () => pm.expect(body.items.length).to.be.at.least(1));",
+              "if (body.nextCursor) {",
+              "  pm.collectionVariables.set('cursor', body.nextCursor);",
+              "  console.log('next cursor stored');",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders?customerId={{customerId}}&limit=5",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders"],
+          "query": [
+            { "key": "customerId", "value": "{{customerId}}" },
+            { "key": "limit", "value": "5" }
+          ]
+        },
+        "description": "Cursor pagination over the customerId-createdAt GSI. Pass nextCursor back as `cursor` for the next page."
+      }
+    },
+    {
+      "name": "6. Out-of-stock rejection",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "console.log('Watch this one land in REJECTED: SKU-LIMITED-1 is seeded with only 2 units.');",
+              "pm.collectionVariables.set('orderId', pm.response.json().orderId);",
+              "pm.collectionVariables.set('pollAttempts', '0');",
+              "pm.execution.setNextRequest('2. Poll timeline until terminal');"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "{{$guid}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"customerEmail\": \"dana@example.com\",\n  \"currency\": \"USD\",\n  \"lines\": [\n    { \"sku\": \"SKU-LIMITED-1\", \"quantity\": 50, \"unitPrice\": 129.00 }\n  ]\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+        "description": "Requests 50 units of a SKU seeded with 2. inventory-service emits InventoryRejected and the order ends REJECTED with nothing charged."
+      }
+    },
+    {
+      "name": "7. Payment decline (compensation)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "console.log('Amount is above the 5000 decline threshold: expect REJECTED plus an orders.cancelled event that releases the hold.');",
+              "pm.collectionVariables.set('orderId', pm.response.json().orderId);",
+              "pm.collectionVariables.set('pollAttempts', '0');",
+              "pm.execution.setNextRequest('2. Poll timeline until terminal');"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "{{$guid}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"customerEmail\": \"dana@example.com\",\n  \"currency\": \"USD\",\n  \"lines\": [\n    { \"sku\": \"SKU-LAPTOP-1\", \"quantity\": 3, \"unitPrice\": 2400.00 }\n  ]\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+        "description": "7200.00 exceeds the simulated gateway's limit, so PaymentFailed drives the compensation path: order REJECTED, OrderCancelled published, stock released."
+      }
+    },
+    {
+      "name": "8. Cancel an in-flight order",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Create a fresh order to cancel, so the test does not depend on earlier state.",
+              "const base = pm.collectionVariables.get('baseUrl');",
+              "pm.sendRequest({",
+              "  url: base + '/api/v1/orders',",
+              "  method: 'POST',",
+              "  header: { 'Content-Type': 'application/json', 'Idempotency-Key': pm.variables.replaceIn('{{$guid}}') },",
+              "  body: { mode: 'raw', raw: JSON.stringify({ customerId: pm.collectionVariables.get('customerId'), customerEmail: 'dana@example.com', currency: 'USD', lines: [{ sku: 'SKU-BOOK-1', quantity: 1, unitPrice: 42.5 }] }) }",
+              "}, (err, res) => {",
+              "  if (!err) { pm.collectionVariables.set('orderId', res.json().orderId); }",
+              "});"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('order is CANCELLED', () => pm.expect(pm.response.json().status).to.eql('CANCELLED'));",
+              "console.log('OrderCancelled published; inventory-service releases any hold it took.');"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"reason\": \"Customer changed their mind\"\n}" },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}/cancel",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders", "{{orderId}}", "cancel"]
+        }
+      }
+    },
+    {
+      "name": "9. Cancel a terminal order (409)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+              "const problem = pm.response.json();",
+              "pm.test('RFC 7807 problem document', () => pm.expect(problem.type).to.include('illegal-state-transition'));",
+              "pm.test('problem carries the correlation id', () => pm.expect(problem).to.have.property('correlationId'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"reason\": \"Second attempt\"\n}" },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}/cancel",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "orders", "{{orderId}}", "cancel"]
+        },
+        "description": "The order cancelled in step 8 is terminal, so the state machine refuses the transition and the API answers 409."
+      }
+    },
+    {
+      "name": "10. Actuator health",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('gateway is UP', () => pm.expect(pm.response.json().status).to.eql('UP'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/actuator/health", "host": ["{{baseUrl}}"], "path": ["actuator", "health"] }
+      }
+    }
+  ]
+}
