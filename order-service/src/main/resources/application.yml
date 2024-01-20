@@ -1,0 +1,112 @@
+server:
+  port: ${SERVER_PORT:8081}
+  shutdown: graceful
+
+spring:
+  application:
+    name: order-service
+  lifecycle:
+    # Let in-flight saga steps finish before the container is killed; ECS sends SIGTERM first.
+    timeout-per-shutdown-phase: 20s
+  main:
+    banner-mode: "off"
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        # Idempotent producer: retries cannot duplicate a record inside a producer session.
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        linger.ms: 5
+        compression.type: snappy
+    consumer:
+      group-id: order-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer keeps the raw bytes of an unparseable record so the
+      # DeadLetterPublishingRecoverer can forward the original payload to <topic>.DLT.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: "io.orderflow.common.event.EventEnvelopeSerde$EnvelopeDeserializer"
+        max.poll.records: 50
+        max.poll.interval.ms: 300000
+    listener:
+      ack-mode: record
+      observation-enabled: true
+
+aws:
+  region: ${AWS_REGION:us-east-1}
+  # Empty means "use the real AWS endpoint"; LocalStack sets AWS_ENDPOINT_URL.
+  endpoint-url: ${AWS_ENDPOINT_URL:}
+  dynamodb:
+    max-retries: 5
+    api-call-timeout-ms: 3000
+
+app:
+  dynamodb:
+    tables:
+      orders: ${ORDERS_TABLE:orders}
+      order-items: ${ORDER_ITEMS_TABLE:order_items}
+      outbox: ${OUTBOX_TABLE:outbox}
+      processed-events: ${PROCESSED_EVENTS_TABLE:processed_events}
+  outbox:
+    initial-delay-ms: 2000
+    poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:500}
+    batch-size: 50
+    max-attempts: 10
+    send-timeout-seconds: 5
+  idempotency:
+    retention-days: 7
+  kafka:
+    listener:
+      concurrency: ${KAFKA_CONCURRENCY:3}
+    retry:
+      initial-interval-ms: 500
+      multiplier: 2.0
+      max-interval-ms: 10000
+      max-retries: 4
+  orders:
+    max-page-size: 100
+    idempotency-retention-hours: 24
+    max-conflict-retries: 5
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    root: INFO
+    io.orderflow: ${LOG_LEVEL:INFO}
+    org.apache.kafka.clients.consumer.internals: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${spring.application.name}] [corr=%X{correlationId:-none} order=%X{orderId:-none}] %logger{36} - %msg%n"

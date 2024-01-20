@@ -1,0 +1,29 @@
+# Local profile: everything points at the docker compose stack (LocalStack + KRaft Kafka).
+# Activate with SPRING_PROFILES_ACTIVE=local, which is what docker-compose.yml sets.
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      # Start from the beginning locally so a restarted service replays the topics it missed.
+      auto-offset-reset: earliest
+
+aws:
+  region: us-east-1
+  endpoint-url: ${AWS_ENDPOINT_URL:http://localhost:4566}
+
+app:
+  outbox:
+    # Tighter loop locally: the demo curl flow feels synchronous at 250 ms.
+    poll-interval-ms: 250
+  kafka:
+    listener:
+      concurrency: 1
+
+logging:
+  level:
+    io.orderflow: DEBUG
+
+management:
+  endpoint:
+    health:
+      show-details: always
