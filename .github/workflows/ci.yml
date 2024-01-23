@@ -1,0 +1,213 @@
+name: CI
+
+# Every push to main and every PR runs the full pipeline. There is deliberately no `paths`
+# filter: a docs-only commit still gets a result, so the head of main always has a status.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run: nobody needs the results of a commit
+# that has already been superseded, and the runner minutes are better spent on the current one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: "21"
+  MAVEN_ARGS: "-B -ntp -Dstyle.color=always"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Compile and run the unit tests for the whole reactor. Integration tests are
+  # excluded here (they need Docker) and run in their own job.
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: Build and unit test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Build and test
+        run: mvn $MAVEN_ARGS verify -DskipITs
+
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: "**/target/surefire-reports/*.xml"
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Testcontainers-based saga integration test. Separate job so a slow Docker
+  # pull never blocks the fast feedback from unit tests.
+  # ---------------------------------------------------------------------------
+  integration-test:
+    name: Saga integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # `verify` runs failsafe, which owns the *IT classes; Docker is available on the runner,
+      # so Testcontainers brings up Kafka and LocalStack itself.
+      - name: Run integration tests
+        run: mvn $MAVEN_ARGS -pl order-service -am verify
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+
+  # ---------------------------------------------------------------------------
+  # Package the shaded Lambda jar and keep it as an artifact: this is exactly
+  # what Terraform and SAM upload, so the deploy uses a tested binary.
+  # ---------------------------------------------------------------------------
+  lambda-package:
+    name: Package Lambda functions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Package
+        run: mvn $MAVEN_ARGS -pl lambda-functions -am package -DskipTests
+
+      - name: Report artifact size
+        run: |
+          # Cold start scales with jar size; fail loudly if it creeps past 50 MB.
+          size_bytes=$(stat -c%s lambda-functions/target/lambda-functions.jar)
+          echo "lambda-functions.jar = $((size_bytes / 1024 / 1024)) MB"
+          test "$size_bytes" -lt 52428800
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-functions-jar
+          path: lambda-functions/target/lambda-functions.jar
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Build every service image. The matrix means one broken Dockerfile does not
+  # hide the state of the other five.
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: Docker (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: build-test
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - order-service
+          - inventory-service
+          - payment-service
+          - notification-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: cloud-order-processing/${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - name: Verify the image starts as a non-root user
+        run: |
+          user=$(docker run --rm --entrypoint id cloud-order-processing/${{ matrix.service }}:${{ github.sha }} -un)
+          echo "image runs as: $user"
+          test "$user" = "spring"
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure as code checks: formatting and validation, no credentials.
+  # ---------------------------------------------------------------------------
+  terraform-validate:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Format check
+        run: terraform -chdir=infrastructure/terraform fmt -check -recursive
+
+      - name: Init without a backend
+        run: terraform -chdir=infrastructure/terraform init -backend=false
+
+      - name: Validate
+        run: terraform -chdir=infrastructure/terraform validate
+
+  sam-validate:
+    name: SAM template validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install AWS SAM CLI
+        run: pip install --quiet aws-sam-cli
+
+      - name: Validate with linting
+        run: sam validate --lint --template infrastructure/sam/template.yaml
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+
+  # ---------------------------------------------------------------------------
+  # Shell scripts are part of the setup contract, so they are linted too.
+  # ---------------------------------------------------------------------------
+  shell-lint:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/*.sh
