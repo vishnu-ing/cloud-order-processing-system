@@ -1,0 +1,204 @@
+{
+  "$comment": [
+    "Canonical DynamoDB schema for the platform: the same keys, indexes, streams and TTL that",
+    "scripts/create-tables.sh applies locally and infrastructure/terraform/dynamodb.tf applies in AWS.",
+    "Each entry is a valid CreateTable input, so it can be fed straight to the CLI:",
+    "  jq -c '.tables[] | select(.TableName==\"orders\")' infrastructure/dynamodb/table-definitions.json \\",
+    "    | aws dynamodb create-table --cli-input-json file:///dev/stdin"
+  ],
+  "billingModeNote": "PAY_PER_REQUEST everywhere: saga traffic is spiky and on-demand removes capacity planning as a failure mode. Switch the high-volume tables (orders, outbox, processed_events) to PROVISIONED with autoscaling once the daily curve is predictable.",
+  "tables": [
+    {
+      "TableName": "orders",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "orderId", "AttributeType": "S" },
+        { "AttributeName": "customerId", "AttributeType": "S" },
+        { "AttributeName": "status", "AttributeType": "S" },
+        { "AttributeName": "createdAt", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "orderId", "KeyType": "HASH" }
+      ],
+      "GlobalSecondaryIndexes": [
+        {
+          "IndexName": "customerId-createdAt-index",
+          "KeySchema": [
+            { "AttributeName": "customerId", "KeyType": "HASH" },
+            { "AttributeName": "createdAt", "KeyType": "RANGE" }
+          ],
+          "Projection": { "ProjectionType": "ALL" },
+          "AccessPattern": "GET /api/v1/orders?customerId=... newest first, cursor paginated"
+        },
+        {
+          "IndexName": "status-createdAt-index",
+          "KeySchema": [
+            { "AttributeName": "status", "KeyType": "HASH" },
+            { "AttributeName": "createdAt", "KeyType": "RANGE" }
+          ],
+          "Projection": {
+            "ProjectionType": "INCLUDE",
+            "NonKeyAttributes": ["customerId", "totalAmount", "currency", "updatedAt"]
+          },
+          "AccessPattern": "Operational sweep for sagas stuck in PENDING or INVENTORY_RESERVED"
+        }
+      ],
+      "StreamSpecification": {
+        "StreamEnabled": true,
+        "StreamViewType": "NEW_AND_OLD_IMAGES"
+      },
+      "TimeToLiveSpecification": { "Enabled": false },
+      "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true },
+      "Notes": "Versioned with an optimistic-lock attribute; timeline entries are embedded so the saga history is written in the same conditional update as the status change."
+    },
+    {
+      "TableName": "order_items",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "orderId", "AttributeType": "S" },
+        { "AttributeName": "sku", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "orderId", "KeyType": "HASH" },
+        { "AttributeName": "sku", "KeyType": "RANGE" }
+      ],
+      "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true },
+      "Notes": "Kept out of the order item to stay clear of the 400 KB item limit on bulk orders."
+    },
+    {
+      "TableName": "inventory",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "sku", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "sku", "KeyType": "HASH" }
+      ],
+      "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true },
+      "Notes": "stock / reserved / version. Sellable = stock - reserved; every write is conditional on version."
+    },
+    {
+      "TableName": "inventory_reservations",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "reservationId", "AttributeType": "S" },
+        { "AttributeName": "orderId", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "reservationId", "KeyType": "HASH" }
+      ],
+      "GlobalSecondaryIndexes": [
+        {
+          "IndexName": "orderId-index",
+          "KeySchema": [
+            { "AttributeName": "orderId", "KeyType": "HASH" }
+          ],
+          "Projection": { "ProjectionType": "ALL" },
+          "AccessPattern": "Compensation: find the hold to release from an OrderCancelled event"
+        }
+      ],
+      "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true },
+      "Notes": "The saga's undo record: authoritative quantities so a replayed cancellation cannot inflate stock."
+    },
+    {
+      "TableName": "payments",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "paymentId", "AttributeType": "S" },
+        { "AttributeName": "orderId", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "paymentId", "KeyType": "HASH" }
+      ],
+      "GlobalSecondaryIndexes": [
+        {
+          "IndexName": "orderId-index",
+          "KeySchema": [
+            { "AttributeName": "orderId", "KeyType": "HASH" }
+          ],
+          "Projection": { "ProjectionType": "ALL" },
+          "AccessPattern": "Pre-capture duplicate check: has this order already been charged?"
+        }
+      ],
+      "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true },
+      "Notes": "Failed attempts are stored too: they are the evidence support needs and the input to the idempotent re-check."
+    },
+    {
+      "TableName": "outbox",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "recordId", "AttributeType": "S" },
+        { "AttributeName": "status", "AttributeType": "S" },
+        { "AttributeName": "createdAt", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "recordId", "KeyType": "HASH" }
+      ],
+      "GlobalSecondaryIndexes": [
+        {
+          "IndexName": "status-createdAt-index",
+          "KeySchema": [
+            { "AttributeName": "status", "KeyType": "HASH" },
+            { "AttributeName": "createdAt", "KeyType": "RANGE" }
+          ],
+          "Projection": { "ProjectionType": "ALL" },
+          "AccessPattern": "OutboxPublisher drains status=PENDING oldest first"
+        }
+      ],
+      "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true },
+      "Notes": "Written in the same TransactWriteItems as the aggregate mutation that produced the event."
+    },
+    {
+      "TableName": "processed_events",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "consumerGroup", "AttributeType": "S" },
+        { "AttributeName": "eventId", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "consumerGroup", "KeyType": "HASH" },
+        { "AttributeName": "eventId", "KeyType": "RANGE" }
+      ],
+      "TimeToLiveSpecification": {
+        "Enabled": true,
+        "AttributeName": "expiresAt"
+      },
+      "Notes": "Dedupe markers with a 7-day TTL. Also namespaces HTTP Idempotency-Key values under the 'order-api' consumer group."
+    },
+    {
+      "TableName": "notifications",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "notificationId", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "notificationId", "KeyType": "HASH" }
+      ],
+      "Notes": "Send outbox for SES: rendered first, delivered second, outcome recorded in status."
+    },
+    {
+      "TableName": "order_read_model",
+      "BillingMode": "PAY_PER_REQUEST",
+      "AttributeDefinitions": [
+        { "AttributeName": "orderId", "AttributeType": "S" },
+        { "AttributeName": "customerId", "AttributeType": "S" },
+        { "AttributeName": "updatedAt", "AttributeType": "S" }
+      ],
+      "KeySchema": [
+        { "AttributeName": "orderId", "KeyType": "HASH" }
+      ],
+      "GlobalSecondaryIndexes": [
+        {
+          "IndexName": "customerId-updatedAt-index",
+          "KeySchema": [
+            { "AttributeName": "customerId", "KeyType": "HASH" },
+            { "AttributeName": "updatedAt", "KeyType": "RANGE" }
+          ],
+          "Projection": { "ProjectionType": "ALL" },
+          "AccessPattern": "Lambda read path: a customer's recent orders for a status page"
+        }
+      ],
+      "Notes": "Eventually consistent projection maintained by OrderEventsStreamProcessor from the orders stream."
+    }
+  ]
+}

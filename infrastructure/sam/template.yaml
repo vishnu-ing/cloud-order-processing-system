@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Cloud-Based Order Processing System - serverless slice.
+
+  Deploys just the read path and the DLQ replay path: the order_read_model table, the three Java
+  Lambda functions and an HTTP API in front of them. This is the fastest way to see the system
+  work end to end without standing up MSK, ECS and a VPC, which is why it exists alongside the
+  full Terraform stack.
+
+  Deploy:
+    mvn -q -pl lambda-functions -am package
+    sam build
+    sam deploy --guided
+
+Globals:
+  Function:
+    Runtime: java21
+    Architectures:
+      - arm64
+    MemorySize: 1024
+    Timeout: 60
+    Tracing: Active
+    # SnapStart is what makes a Java handler acceptable on a customer-facing route: the JVM is
+    # restored from a pre-initialised snapshot instead of booting on the first request. Snapshots
+    # only exist for published versions, so every function gets a `live` alias and the event
+    # sources and API routes invoke that alias rather than $LATEST.
+    SnapStart:
+      ApplyOn: PublishedVersions
+    AutoPublishAlias: live
+    Environment:
+      Variables:
+        READ_MODEL_TABLE: !Ref OrderReadModelTable
+        JAVA_TOOL_OPTIONS: "-XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+    Tags:
+      Project: order-processing
+      ManagedBy: sam
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment suffix for resource names.
+
+  KafkaBootstrapServers:
+    Type: String
+    Default: ""
+    Description: >
+      MSK bootstrap string for the DLQ reprocessor. Leave empty to deploy the read path only;
+      the reprocessor is still created but will fail fast if invoked, which is preferable to
+      silently replaying nowhere.
+
+  JwtIssuer:
+    Type: String
+    Default: ""
+    Description: OIDC issuer URL. Empty deploys the API without an authorizer (dev only).
+
+  JwtAudience:
+    Type: String
+    Default: order-api
+    Description: Accepted JWT audience.
+
+  ThrottleRateLimit:
+    Type: Number
+    Default: 100
+    Description: Steady-state requests per second at the stage.
+
+  ThrottleBurstLimit:
+    Type: Number
+    Default: 200
+    Description: Burst capacity at the stage.
+
+Conditions:
+  HasJwtIssuer: !Not [!Equals [!Ref JwtIssuer, ""]]
+
+Resources:
+
+  ##########################################################################
+  # Data
+  ##########################################################################
+
+  OrderReadModelTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "order-processing-${Environment}-order-read-model"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: updatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customerId-updatedAt-index
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: updatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  # Source of truth in this slice. In the full stack this table is owned by order-service and
+  # created by Terraform; here it is created so the stream has something to read.
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "order-processing-${Environment}-orders"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customerId-createdAt-index
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-createdAt-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ##########################################################################
+  # DLQ replay path
+  ##########################################################################
+
+  DlqParkingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "order-processing-${Environment}-dlq-parking"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  DlqReplayQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "order-processing-${Environment}-dlq-replay"
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DlqParkingQueue.Arn
+        maxReceiveCount: 3
+
+  ##########################################################################
+  # HTTP API
+  ##########################################################################
+
+  OrdersHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: !If [HasJwtIssuer, JwtAuthorizer, !Ref "AWS::NoValue"]
+        Authorizers: !If
+          - HasJwtIssuer
+          - JwtAuthorizer:
+              IdentitySource: "$request.header.Authorization"
+              JwtConfiguration:
+                issuer: !Ref JwtIssuer
+                audience:
+                  - !Ref JwtAudience
+          - !Ref "AWS::NoValue"
+      # Stage-wide throttling: HTTP APIs take it as default route settings.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ThrottleBurstLimit
+        ThrottlingRateLimit: !Ref ThrottleRateLimit
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - authorization
+          - content-type
+          - x-correlation-id
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","correlationId":"$context.request.header.x-correlation-id","routeKey":"$context.routeKey","status":"$context.status","latency":"$context.responseLatency"}
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/order-processing-${Environment}-sam"
+      RetentionInDays: 30
+
+  ##########################################################################
+  # Functions
+  ##########################################################################
+
+  OrderEventsStreamProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "order-processing-${Environment}-order-events-stream-processor"
+      CodeUri: ../../lambda-functions
+      Handler: io.orderflow.lambda.OrderEventsStreamProcessor::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrderReadModelTable
+        - DynamoDBStreamReadPolicy:
+            TableName: !Ref OrdersTable
+            StreamName: !Select [3, !Split ["/", !GetAtt OrdersTable.StreamArn]]
+      Events:
+        OrdersStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt OrdersTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 2
+            ParallelizationFactor: 2
+            # Isolate a poison record instead of retrying the whole batch forever.
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+            MaximumRecordAgeInSeconds: 3600
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt DlqParkingQueue.Arn
+
+  OrderStatusApiHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "order-processing-${Environment}-order-status-api"
+      CodeUri: ../../lambda-functions
+      Handler: io.orderflow.lambda.OrderStatusApiHandler::handleRequest
+      Timeout: 15
+      # Read-only: the serverless read path cannot mutate the projection.
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrderReadModelTable
+      Events:
+        OrderStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref OrdersHttpApi
+            Method: GET
+            Path: /api/v1/orders/{orderId}/status
+        CustomerOrders:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref OrdersHttpApi
+            Method: GET
+            Path: /api/v1/customers/{customerId}/orders
+
+  KafkaDlqReprocessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "order-processing-${Environment}-kafka-dlq-reprocessor"
+      CodeUri: ../../lambda-functions
+      Handler: io.orderflow.lambda.KafkaDlqReprocessor::handleRequest
+      MemorySize: 1536
+      # A Kafka producer inside a snapshot restores with stale connections; keep it off SnapStart.
+      SnapStart:
+        ApplyOn: None
+      Environment:
+        Variables:
+          KAFKA_BOOTSTRAP_SERVERS: !Ref KafkaBootstrapServers
+          KAFKA_SECURITY_PROTOCOL: SASL_SSL
+          KAFKA_SASL_MECHANISM: AWS_MSK_IAM
+          MAX_REPLAY_ATTEMPTS: "3"
+          SEND_TIMEOUT_SECONDS: "10"
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt DlqReplayQueue.QueueName
+      Events:
+        ReplayQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DlqReplayQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            # Only the messages the handler reports as failed are redelivered.
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 2
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the serverless read path.
+    Value: !Sub "https://${OrdersHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+
+  OrderStatusUrl:
+    Description: Example status request.
+    Value: !Sub "https://${OrdersHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/api/v1/orders/{orderId}/status"
+
+  OrdersTableName:
+    Description: Write-model table whose stream feeds the projection.
+    Value: !Ref OrdersTable
+
+  ReadModelTableName:
+    Description: Projection table served by the status handler.
+    Value: !Ref OrderReadModelTable
+
+  DlqReplayQueueUrl:
+    Description: Drop a dead-lettered event here to have it replayed onto its live topic.
+    Value: !Ref DlqReplayQueue
