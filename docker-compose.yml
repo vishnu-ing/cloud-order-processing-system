@@ -1,0 +1,233 @@
+# Full local stack: KRaft Kafka, LocalStack (DynamoDB/Lambda/SQS/API Gateway) and all six
+# Spring Boot services. One network, real healthchecks, and start ordering that mirrors the
+# dependency graph — so `docker compose up -d` converges without manual nudging.
+#
+#   gateway      http://localhost:8080
+#   kafka-ui     http://localhost:8081
+#   localstack   http://localhost:4566
+#
+name: cloud-order-processing
+
+services:
+
+  # ---------------------------------------------------------------- infrastructure
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft: this node is both broker and controller, so there is no ZooKeeper anywhere.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by scripts/create-topics.sh with the right partition counts.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:29092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - orders
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: kafka-setup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    entrypoint: ["bash", "/scripts/create-topics.sh"]
+    restart: "no"
+    networks:
+      - orders
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    ports:
+      - "8081:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-kraft
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks:
+      - orders
+
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: dynamodb,lambda,sqs,apigateway
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      DEBUG: "0"
+      LAMBDA_KEEPALIVE_MS: "300000"
+    volumes:
+      # ready.d hooks run once LocalStack reports healthy: tables exist before any service starts.
+      - ./scripts/create-tables.sh:/etc/localstack/init/ready.d/create-tables.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - orders
+
+  # ---------------------------------------------------------------- application services
+  order-service:
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    image: cloud-order-processing/order-service:local
+    container_name: order-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SERVER_PORT: 8081
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      KAFKA_CONCURRENCY: 2
+    ports:
+      - "8091:8081"
+    networks:
+      - orders
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: inventory-service/Dockerfile
+    image: cloud-order-processing/inventory-service:local
+    container_name: inventory-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SERVER_PORT: 8082
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    ports:
+      - "8092:8082"
+    networks:
+      - orders
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: payment-service/Dockerfile
+    image: cloud-order-processing/payment-service:local
+    container_name: payment-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SERVER_PORT: 8083
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      # Orders over 5000 are declined; everything else is captured. See SimulatedPaymentGateway.
+      PAYMENT_DECLINE_ABOVE: "5000.00"
+    ports:
+      - "8093:8083"
+    networks:
+      - orders
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+    image: cloud-order-processing/notification-service:local
+    container_name: notification-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SERVER_PORT: 8084
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    ports:
+      - "8094:8084"
+    networks:
+      - orders
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    image: cloud-order-processing/api-gateway:local
+    container_name: api-gateway
+    depends_on:
+      order-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+      notification-service:
+        condition: service_started
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SERVER_PORT: 8080
+      ORDER_SERVICE_URI: http://order-service:8081
+      INVENTORY_SERVICE_URI: http://inventory-service:8082
+      PAYMENT_SERVICE_URI: http://payment-service:8083
+      NOTIFICATION_SERVICE_URI: http://notification-service:8084
+      APP_SECURITY_JWT_ENABLED: "false"
+      RATE_LIMIT_RPM: "6000"
+    ports:
+      - "8080:8080"
+    networks:
+      - orders
+
+networks:
+  orders:
+    name: cloud-order-processing
+    driver: bridge
