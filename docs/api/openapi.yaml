@@ -1,0 +1,462 @@
+openapi: 3.1.0
+
+info:
+  title: Cloud-Based Order Processing System API
+  version: 1.0.0
+  description: |
+    Public API for the order processing platform.
+
+    **Asynchronous by design.** `POST /api/v1/orders` returns `201` as soon as the order is
+    durably stored in `PENDING` — the saga (stock hold, payment capture, confirmation) continues
+    in the background over Kafka. Clients poll `GET /api/v1/orders/{orderId}` or
+    `GET /api/v1/orders/{orderId}/timeline` rather than waiting for a synchronous confirmation.
+
+    **Idempotency.** Send an `Idempotency-Key` on `POST /api/v1/orders`. A retry with the same key
+    returns `200` with the order the first attempt created instead of charging the customer twice.
+
+    **Correlation.** Every response carries `X-Correlation-Id`; quoting it in a support ticket is
+    enough to trace the request through every service.
+
+    **Errors** are RFC 7807 `application/problem+json` and include the `correlationId`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local docker compose stack (through api-gateway)
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com
+    description: AWS HTTP API
+    variables:
+      apiId:
+        default: abcd1234
+      region:
+        default: us-east-1
+
+tags:
+  - name: Orders
+    description: Create, inspect and cancel orders
+  - name: Saga
+    description: Saga progress and event history
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/orders:
+    post:
+      tags: [Orders]
+      summary: Create an order and start the saga
+      operationId: createOrder
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrderRequest"
+            examples:
+              twoLines:
+                summary: Two-line order
+                value:
+                  customerId: cust-9f2a
+                  customerEmail: dana@example.com
+                  currency: USD
+                  lines:
+                    - sku: SKU-BOOK-1
+                      quantity: 2
+                      unitPrice: 42.50
+                    - sku: SKU-HEADSET-1
+                      quantity: 1
+                      unitPrice: 189.00
+      responses:
+        "201":
+          description: Order accepted and persisted as PENDING; the saga is running.
+          headers:
+            Location:
+              schema: { type: string }
+              description: Canonical URL of the new order.
+            X-Correlation-Id:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "200":
+          description: Replay of an earlier request with the same `Idempotency-Key`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+    get:
+      tags: [Orders]
+      summary: List orders by customer or by status
+      description: |
+        Exactly one of `customerId` or `status` is required: both are GSI partition keys, and a
+        query without one would degrade into a table scan.
+
+        Pagination is cursor-based. `nextCursor` is an opaque encoding of the DynamoDB
+        `LastEvaluatedKey`; pass it back as `cursor` to fetch the next page. A `null` cursor means
+        the last page. Do not parse it — the format is not part of this contract.
+      operationId: listOrders
+      parameters:
+        - name: customerId
+          in: query
+          schema: { type: string, maxLength: 64 }
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/OrderStatus"
+        - name: cursor
+          in: query
+          description: Opaque cursor from a previous response.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: One page of orders, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/orders/{orderId}:
+    get:
+      tags: [Orders]
+      summary: Fetch a single order with its lines
+      operationId: getOrder
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/orders/{orderId}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel an order and trigger inventory compensation
+      description: |
+        Allowed while the order is `PENDING` or `INVENTORY_RESERVED`. Publishes `OrderCancelled`,
+        which is what releases any stock hold. Cancelling a terminal order returns `409`.
+      operationId: cancelOrder
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 280
+              example:
+                reason: Customer changed their mind
+      responses:
+        "200":
+          description: Order cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /api/v1/orders/{orderId}/timeline:
+    get:
+      tags: [Saga]
+      summary: Saga event history for an order, oldest first
+      description: |
+        Each entry records the status the order moved to, the event that caused it, and the
+        `causationId` linking it to the previous step — a causal chain, not a log dump.
+      operationId: getOrderTimeline
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: Ordered saga history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderTimeline"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/orders/{orderId}/status:
+    get:
+      tags: [Saga]
+      summary: Lightweight status from the serverless read model
+      description: |
+        Served by `OrderStatusApiHandler` (AWS Lambda) from the `order_read_model` projection, not
+        by order-service. Eventually consistent — typically under a second behind the write model —
+        and cheap enough to poll.
+      operationId: getOrderStatus
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: Projected order status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderProjection"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Validated at the edge (API Gateway JWT authorizer in AWS, Spring Security in the gateway
+        service) and relayed downstream untouched. Disabled in the local compose stack.
+
+  parameters:
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-generated key, typically a UUID. Retries with the same key are deduplicated for 24 hours.
+      schema: { type: string, maxLength: 128 }
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Supply your own trace id, or one is generated and returned.
+      schema: { type: string, maxLength: 128 }
+
+  responses:
+    BadRequest:
+      description: Validation failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: urn:problem-type:orders:validation-failed
+            title: Request validation failed
+            status: 400
+            detail: One or more fields are invalid
+            correlationId: 6f1c4f0e-6f6a-4c2e-bb1f-0d3a7e8a9c11
+            errors:
+              "lines[0].quantity": must be greater than or equal to 1
+    NotFound:
+      description: No such order.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+    Conflict:
+      description: The order is not in a state where this operation applies.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: urn:problem-type:orders:illegal-state-transition
+            title: Illegal order state transition
+            status: 409
+            detail: Order 0f6c... cannot transition from CONFIRMED to CANCELLED
+            currentStatus: CONFIRMED
+            requestedStatus: CANCELLED
+    TooManyRequests:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+    Unavailable:
+      description: Upstream temporarily unavailable; retry with the same Idempotency-Key.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+  schemas:
+
+    OrderStatus:
+      type: string
+      enum: [PENDING, INVENTORY_RESERVED, PAYMENT_CAPTURED, CONFIRMED, REJECTED, CANCELLED, FAILED]
+      description: |
+        `PENDING` accepted, saga running. `INVENTORY_RESERVED` stock held.
+        `PAYMENT_CAPTURED` funds taken, awaiting the confirmation write.
+        `CONFIRMED` happy-path terminal. `REJECTED` a business decision went against the order.
+        `CANCELLED` withdrawn by the customer or by compensation. `FAILED` needs an operator.
+
+    OrderLineRequest:
+      type: object
+      required: [sku, quantity, unitPrice]
+      properties:
+        sku: { type: string, maxLength: 64 }
+        quantity: { type: integer, minimum: 1, maximum: 1000 }
+        unitPrice: { type: number, minimum: 0.01, examples: [42.50] }
+
+    CreateOrderRequest:
+      type: object
+      required: [customerId, customerEmail, lines, currency]
+      properties:
+        customerId: { type: string, maxLength: 64 }
+        customerEmail: { type: string, format: email }
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          description: ISO-4217 code.
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 25
+          description: Capped at 25 so the order write stays inside DynamoDB's 100-item transaction limit.
+          items:
+            $ref: "#/components/schemas/OrderLineRequest"
+
+    OrderLine:
+      type: object
+      properties:
+        sku: { type: string }
+        quantity: { type: integer }
+        unitPrice: { type: number }
+        lineTotal: { type: number }
+
+    Order:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        customerId: { type: string }
+        customerEmail: { type: string, format: email }
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        totalAmount: { type: number }
+        currency: { type: string }
+        reservationId:
+          type: [string, "null"]
+          description: Present once inventory has been held.
+        paymentId:
+          type: [string, "null"]
+        failureCode:
+          type: [string, "null"]
+          examples: [CARD_DECLINED, INVENTORY_REJECTED, FRAUD_SUSPECTED]
+        failureReason:
+          type: [string, "null"]
+        correlationId: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        lines:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderLine"
+
+    OrderSummary:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        customerId: { type: string }
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        totalAmount: { type: number }
+        currency: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    OrderPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderSummary"
+        limit: { type: integer }
+        nextCursor:
+          type: [string, "null"]
+          description: Pass back as `cursor`. Null on the last page.
+
+    TimelineEvent:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        eventType:
+          type: string
+          examples: [ORDER_CREATED, INVENTORY_RESERVED, PAYMENT_CAPTURED, ORDER_CONFIRMED]
+        eventId: { type: string, format: uuid }
+        causationId:
+          type: [string, "null"]
+          description: eventId of the event that caused this one.
+        correlationId: { type: string }
+        detail: { type: string }
+        occurredAt: { type: string, format: date-time }
+
+    OrderTimeline:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/TimelineEvent"
+
+    OrderProjection:
+      type: object
+      description: Denormalised projection maintained from the orders DynamoDB stream.
+      properties:
+        orderId: { type: string, format: uuid }
+        customerId: { type: string }
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        totalAmount: { type: number }
+        currency: { type: string }
+        lineCount: { type: integer }
+        lastEventType: { type: string }
+        correlationId: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        sagaDurationMillis:
+          type: [integer, "null"]
+          description: End-to-end saga latency; set once the order reaches a terminal state.
+        revision: { type: integer }
+
+    ProblemDetail:
+      type: object
+      description: RFC 7807 problem document.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        correlationId: { type: string }
+      additionalProperties: true
